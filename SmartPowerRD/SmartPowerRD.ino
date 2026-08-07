@@ -7,68 +7,135 @@
   Profesor   : Luis Bessewell Feliz
   Estudiante : Cristian Carrera - Matricula 2024-1932
   Institucion: Instituto Tecnologico de Las Americas (ITLA)
-  Placa      : ESP32 DevKit v1 (Arduino core 3.x) - simulable en Wokwi
-  ----------------------------------------------------------------------------
-  QUE HACE
-  ----------------------------------------------------------------------------
-  Mide de forma continua el voltaje y la corriente de la acometida electrica
-  de la vivienda. Cuando detecta un apagon (o un voltaje fuera del rango
-  seguro de 100 V - 135 V) conmuta la carga al inversor mediante un relevador
-  de transferencia, avisa localmente con LED y zumbador, y publica el evento
-  por MQTT para que llegue al telefono del usuario.
+  Placa      : ESP32 DevKit v1 / DevKit-C v4 (Arduino core 3.x)
+  Version    : 2.0 - incorpora la retroalimentacion del facilitador
 
   ----------------------------------------------------------------------------
-  POR QUE ESTE PROGRAMA ES MULTITAREA (y no puede no serlo)
+  QUE CAMBIO EN LA VERSION 2.0 Y POR QUE
   ----------------------------------------------------------------------------
-  El sistema tiene cuatro obligaciones con plazos MUY distintos:
+  La primera version media UNA sola fase, no vigilaba el estado del banco de
+  baterias, y -el defecto mas grave- el propio monitor se alimentaba de la red
+  electrica. Es decir: en un apagon el equipo se apagaba justo en el instante
+  para el que fue construido. Las tres correcciones:
 
-     Muestreo electrico ...... cada  50 ms  (no puede perder un solo ciclo)
-     Logica de proteccion .... cada 100 ms  (debe reaccionar en < 500 ms)
-     Refresco de pantalla .... cada 500 ms  (el I2C es lento: ~30 ms)
-     Publicacion en la nube .. cada   5 s   (puede bloquearse varios segundos
-                                             si el WiFi se cae)
+  1. FASE PARTIDA (120/240 V). Se miden las DOS lineas por separado.
+  2. RESPALDO PROPIO. El equipo se alimenta del bus de 12 V del inversor y
+     vigila el voltaje de la bateria.
+  3. QUE SE PROTEGE. Se separa proteger los electrodomesticos de proteger el
+     inversor, con un rele de deslastre para las cargas no esenciales.
 
-  Con un unico loop() secuencial, un solo reintento de conexion WiFi (que
-  puede tardar 8 segundos) dejaria al sistema CIEGO ante un apagon durante
-  todo ese tiempo. La solucion es aislar cada obligacion en su propia tarea
-  de FreeRTOS, con su propia prioridad, de modo que el planificador (scheduler)
-  expulse a la tarea lenta y le devuelva la CPU a la tarea critica.
+  ============================================================================
+  1. ¿UNA FASE O DOS FASES?
+  ============================================================================
+  En Republica Dominicana la acometida residencial tiene dos formas:
 
-  Ademas se aprovechan los DOS nucleos del ESP32:
-     Nucleo 1 -> tiempo real (muestreo, control, pantalla)
-     Nucleo 0 -> comunicaciones (WiFi/MQTT), que es donde vive el stack de red
+    MONOFASICA A DOS HILOS (120 V)
+      Una linea viva y un neutro. Apartamentos y viviendas pequeñas, sin
+      equipos de 240 V.
 
-  ----------------------------------------------------------------------------
-  MECANISMOS DE CONCURRENCIA UTILIZADOS (cada uno resuelve un problema real)
-  ----------------------------------------------------------------------------
-  1. QueueHandle_t  colaMuestras -> paso de mensajes productor/consumidor entre
-     la tarea de muestreo y la de control. Evita variables globales compartidas.
-  2. SemaphoreHandle_t mutexEstado -> exclusion mutua sobre la estructura de
-     estado que leen la pantalla y la red mientras el control la escribe.
-     Sin el, la pantalla podria mostrar el voltaje nuevo con el estado viejo.
-  3. SemaphoreHandle_t semAlerta -> semaforo binario usado como SENAL: la tarea
-     de red duerme sobre el y despierta al instante cuando ocurre un evento,
-     en lugar de encuestar (polling) desperdiciando CPU.
-  4. volatile + portMUX_TYPE -> seccion critica corta para el contador que
-     modifica la interrupcion (ISR) del boton de silencio.
+    MONOFASICA TRIFILAR o "FASE PARTIDA" (120/240 V)   <- el caso general
+      DOS lineas vivas (L1 y L2) desfasadas 180 grados, mas un neutro.
+      De cada linea al neutro hay 120 V; entre las dos lineas, 240 V.
+      Es lo habitual en viviendas con aire acondicionado, calentador
+      electrico, estufa o bomba de agua.
 
-  ----------------------------------------------------------------------------
-  MONTAJE (simulacion en Wokwi)
-  ----------------------------------------------------------------------------
-  En la vida real el voltaje se lee con un modulo ZMPT101B y la corriente con
-  un sensor de efecto Hall no invasivo SCT-013-030. Ambos entregan una senal
-  analogica, asi que en el simulador se sustituyen por dos potenciometros que
-  permiten "provocar" el apagon a voluntad durante la demostracion.
+  POR QUE NO BASTA CON MEDIR UNA SOLA LINEA:
 
-     GPIO 34 (ADC) .. Potenciometro 1  -> simula el sensor de voltaje  (0-260 V)
-     GPIO 35 (ADC) .. Potenciometro 2  -> simula el sensor de corriente (0-30 A)
-     GPIO 26 ........ Rele de transferencia (bobina)
-     GPIO 25 ........ LED verde    - energia de la red electrica presente
-     GPIO 33 ........ LED amarillo - operando desde el inversor
-     GPIO 32 ........ LED rojo     - alarma / bateria baja
-     GPIO 27 ........ Zumbador piezoelectrico
-     GPIO 14 ........ Boton de silencio de alarma (INPUT_PULLUP, con ISR)
-     GPIO 21/22 ..... LCD 16x2 I2C (SDA/SCL), direccion 0x27
+    a) FASE PERDIDA. Un fusible del transformador de la distribuidora puede
+       abrirse y dejar sin servicio UNA sola linea. Si el monitor solo vigila
+       L1 y la que muere es L2, el sistema no se entera: la mitad de la casa
+       queda sin luz y los equipos de 240 V arrancan con medio voltaje, que
+       es la forma mas rapida de quemar el compresor de un aire.
+
+    b) NEUTRO PERDIDO. Es la falla mas destructiva de una instalacion
+       residencial. Si el neutro se suelta, las dos lineas quedan en serie a
+       traves de las cargas: la linea con menos carga SUBE hacia 200 V o mas
+       y la otra COLAPSA. Con un solo sensor esto es invisible; con dos se
+       detecta al instante, porque la suma de ambas se mantiene cerca de 240
+       mientras el desbalance entre ellas se dispara.
+
+  DECISION DE DISEÑO: se implementa el caso general de fase partida. Para una
+  vivienda monofasica simple basta con poner MONOFASICO en true; el mismo
+  codigo ignora entonces la segunda linea.
+
+  ============================================================================
+  2. ¿QUE SE PROTEGE: EL INVERSOR O LOS ELECTRODOMESTICOS?
+  ============================================================================
+  Son DOS objetivos distintos y a veces opuestos. Conviene decidirlo, no
+  dejarlo implicito:
+
+  ESCENARIO A - Proteger los ELECTRODOMESTICOS (con inversor)
+      Ante voltaje peligroso se transfiere la carga al inversor. El equipo
+      queda alimentado con onda limpia. Es el objetivo principal.
+
+  ESCENARIO B - Proteger el INVERSOR (y el banco de baterias)
+      Aqui aparece el conflicto: el inversor aguanta 2400 W y la vivienda
+      puede pedir 5000 W. Transferirlo todo lo sobrecarga y lo apaga por
+      proteccion, con lo que se pierde hasta el refrigerador.
+      La solucion es el DESLASTRE DE CARGA: un segundo rele corta los
+      circuitos NO esenciales (aire acondicionado, calentador, secadora) y
+      deja vivos los esenciales (nevera, luces, comunicaciones).
+      Ademas se vigila la bateria: por debajo de 11.8 V se corta todo lo no
+      esencial, porque descargar plomo-acido por debajo del 50 % le acorta
+      la vida a la mitad.
+
+  ESCENARIO C - SIN inversor
+      Muchas viviendas no lo tienen. Entonces el sistema no puede dar
+      continuidad, pero SI puede proteger: abre el contactor y desconecta la
+      casa de la red cuando el voltaje es peligroso, avisa, y vuelve a
+      conectar cuando se normaliza. Se activa poniendo HAY_INVERSOR en false.
+
+  ============================================================================
+  3. LA BATERIA DEL PROPIO MONITOR (el punto mas importante)
+  ============================================================================
+  El facilitador señalo un defecto real de la version 1: mientras el programa
+  intenta reconectar, o cuando se va la luz, el equipo deja de mirar el
+  voltaje. Son DOS problemas distintos con DOS soluciones distintas, y
+  conviene no confundirlos:
+
+    PROBLEMA DE SOFTWARE: una tarea lenta bloquea a la critica.
+      -> Solucion: FreeRTOS. La tarea de red vive en el Nucleo 0 y puede
+         bloquearse 8 segundos reconectando sin que el muestreo, que corre en
+         el Nucleo 1 con prioridad mas alta, pierda un solo ciclo.
+
+    PROBLEMA DE HARDWARE: en un apagon el equipo se queda sin corriente.
+      -> Solucion: alimentacion de respaldo. Ninguna arquitectura de software
+         salva a un microcontrolador apagado.
+
+  COMO SE RESUELVE EL SEGUNDO:
+  En lugar de alimentar el ESP32 desde los 120 V AC con una fuente HLK-PM01,
+  se alimenta desde el BUS DE 12 V DEL BANCO DE BATERIAS del inversor, con un
+  convertidor reductor (MP1584 o LM2596) a 5 V. Ventajas:
+
+    - El monitor sigue vivo durante todo el apagon, que es justo cuando sus
+      datos valen algo: puede cronometrar el corte, contarlo y avisar.
+    - No hay que mantener una segunda bateria aparte.
+    - De paso puede MEDIR el voltaje del banco, y asi estimar la autonomia
+      restante y avisar antes de que el inversor se apague solo.
+
+  Se añade un divisor de tension (100k / 33k) para leer los 12 V con el ADC
+  de 3.3 V del ESP32. Para la vivienda SIN inversor, la alternativa es una
+  celda 18650 con modulo TP4056 y elevador a 5 V.
+
+  ============================================================================
+  MONTAJE
+  ============================================================================
+     GPIO 34 (ADC) .. sensor de voltaje  LINEA 1  (ZMPT101B)
+     GPIO 39 (ADC) .. sensor de voltaje  LINEA 2  (ZMPT101B)
+     GPIO 35 (ADC) .. sensor de corriente LINEA 1 (SCT-013-030)
+     GPIO 36 (ADC) .. sensor de corriente LINEA 2 (SCT-013-030)
+     GPIO 33 (ADC) .. voltaje del banco de baterias (divisor 100k/33k)
+     GPIO 26 ........ rele de TRANSFERENCIA (red <-> inversor)
+     GPIO 25 ........ rele de DESLASTRE (corta cargas no esenciales)
+     GPIO  4 ........ LED verde    - red electrica correcta
+     GPIO  2 ........ LED amarillo - operando desde el inversor
+     GPIO 13 ........ LED rojo     - alarma
+     GPIO 27 ........ zumbador
+     GPIO 14 ........ boton de silencio (INPUT_PULLUP, con interrupcion)
+     GPIO 21/22 ..... LCD 16x2 I2C
+
+  En la simulacion los sensores se sustituyen por potenciometros, que
+  permiten provocar cada falla a voluntad durante la demostracion.
   ============================================================================
 */
 
@@ -77,10 +144,6 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 
-// Si existe el archivo secrets.h se usan sus credenciales; si no (por ejemplo
-// al pegar solo este sketch en Wokwi), se aplican las del simulador. Asi el
-// proyecto arranca de una sola pieza sin dejar de separar las credenciales
-// del codigo cuando se compila para hardware real.
 #if __has_include("secrets.h")
   #include "secrets.h"
 #else
@@ -96,121 +159,161 @@
 #endif
 
 // ---------------------------------------------------------------------------
-// 1. Mapa de pines y constantes de calibracion
+// CONFIGURACION DE LA INSTALACION
+// Estas dos constantes adaptan el mismo programa a las tres realidades
+// descritas arriba, sin tocar una sola linea de logica.
 // ---------------------------------------------------------------------------
-const uint8_t PIN_SENSOR_VOLTAJE   = 34;
-const uint8_t PIN_SENSOR_CORRIENTE = 35;
-const uint8_t PIN_RELE_TRANSFER    = 26;
-const uint8_t PIN_LED_RED          = 25;
-const uint8_t PIN_LED_INVERSOR     = 33;
-const uint8_t PIN_LED_ALARMA       = 32;
-const uint8_t PIN_ZUMBADOR         = 27;
-const uint8_t PIN_BOTON_SILENCIO   = 14;
+const bool MONOFASICO   = false;  // true = 120 V a dos hilos (ignora L2)
+const bool HAY_INVERSOR = true;   // false = solo desconecta y avisa
 
-const float VOLTAJE_MAXIMO   = 260.0;  // fondo de escala del sensor
-const float CORRIENTE_MAXIMA =  30.0;  // fondo de escala del SCT-013-030
-const float ADC_MAXIMO       = 4095.0; // ADC de 12 bits del ESP32
+// ---------------------------------------------------------------------------
+// Mapa de pines
+// ---------------------------------------------------------------------------
+const uint8_t PIN_V_L1     = 34;
+const uint8_t PIN_V_L2     = 39;
+const uint8_t PIN_I_L1     = 35;
+const uint8_t PIN_I_L2     = 36;
+const uint8_t PIN_V_BAT    = 33;
 
-// Umbrales de proteccion (norma domestica dominicana: 120 V / 60 Hz)
-const float V_MINIMO_SEGURO = 100.0;   // por debajo: bajo voltaje
-const float V_MAXIMO_SEGURO = 135.0;   // por encima: sobrevoltaje
-const float V_APAGON        =  40.0;   // por debajo: no hay red electrica
+const uint8_t PIN_RELE_TRANSFER  = 26;
+const uint8_t PIN_RELE_DESLASTRE = 25;
+const uint8_t PIN_LED_RED        = 4;
+const uint8_t PIN_LED_INVERSOR   = 2;
+const uint8_t PIN_LED_ALARMA     = 13;
+const uint8_t PIN_ZUMBADOR       = 27;
+const uint8_t PIN_BOTON_SILENCIO = 14;
 
-// Periodos de cada tarea, expresados en milisegundos
+// ---------------------------------------------------------------------------
+// Calibracion
+// ---------------------------------------------------------------------------
+const float VOLTAJE_MAXIMO   = 260.0;   // fondo de escala del ZMPT101B
+const float CORRIENTE_MAXIMA =  30.0;   // fondo de escala del SCT-013-030
+const float BATERIA_MAXIMA   =  15.0;   // fondo de escala del divisor
+const float ADC_MAXIMO       = 4095.0;  // ADC de 12 bits del ESP32
+
+// Umbrales de la red (norma domestica dominicana: 120 V / 60 Hz)
+const float V_MINIMO_SEGURO = 100.0;
+const float V_MAXIMO_SEGURO = 135.0;
+const float V_APAGON        =  40.0;
+
+// Desbalance entre lineas que delata un NEUTRO PERDIDO.
+// En condiciones normales L1 y L2 no difieren mas de unos 5 V.
+const float DESBALANCE_CRITICO = 25.0;
+
+// Banco de baterias de 12 V (plomo-acido)
+const float BAT_LLENA   = 12.7;   // 100 % en reposo
+const float BAT_BAJA    = 11.8;   // ~50 %: hay que deslastrar
+const float BAT_CRITICA = 11.4;   // ~20 %: el inversor se apagara pronto
+
+// Capacidad del inversor. Por encima de esto hay que deslastrar.
+const float POTENCIA_MAXIMA_INVERSOR = 2400.0;   // watts
+
+// Periodos de cada tarea
 const TickType_t PERIODO_MUESTREO = pdMS_TO_TICKS(50);
 const TickType_t PERIODO_PANTALLA = pdMS_TO_TICKS(500);
 const TickType_t PERIODO_RED      = pdMS_TO_TICKS(5000);
 
 // ---------------------------------------------------------------------------
-// 2. Tipos de datos del dominio
+// Estados del sistema. El orden va de menos a mas grave.
 // ---------------------------------------------------------------------------
 enum EstadoEnergia {
-  RED_NORMAL,      // la red electrica esta presente y dentro de rango
-  RED_ANORMAL,     // hay red, pero el voltaje es peligroso para los equipos
-  APAGON,          // no hay red electrica
-  MODO_INVERSOR    // la carga ya fue transferida al inversor
+  RED_NORMAL,      // las dos lineas dentro de rango
+  RED_ANORMAL,     // hay red, pero el voltaje es peligroso
+  FASE_PERDIDA,    // una linea murio y la otra sigue viva
+  NEUTRO_PERDIDO,  // desbalance grave: la falla mas destructiva
+  APAGON,          // no hay red en ninguna linea
+  MODO_INVERSOR    // la carga ya fue transferida
 };
 
-// Mensaje que viaja por la cola: la tarea de muestreo lo produce, la de
-// control lo consume. Se envia por VALOR (copia), por eso no hace falta
-// proteger nada: la cola de FreeRTOS ya es segura entre tareas.
+const char *NOMBRE_ESTADO[] = {
+  "RED_NORMAL", "RED_ANORMAL", "FASE_PERDIDA",
+  "NEUTRO_PERDIDO", "APAGON", "MODO_INVERSOR"
+};
+
 struct Muestra {
-  float    voltaje;
-  float    corriente;
+  float    voltajeL1;
+  float    voltajeL2;
+  float    corrienteL1;
+  float    corrienteL2;
+  float    voltajeBateria;
   float    potencia;
   uint32_t marcaTiempo;
 };
 
-// Estado compartido: lo escribe la tarea de control y lo LEEN la pantalla y
-// la red. Todo acceso debe hacerse tomando primero "mutexEstado".
 struct EstadoSistema {
-  float         voltaje;
-  float         corriente;
+  float         voltajeL1;
+  float         voltajeL2;
+  float         corrienteL1;
+  float         corrienteL2;
   float         potencia;
-  float         energiaWh;      // energia acumulada desde el arranque
+  float         energiaWh;
+  float         voltajeBateria;
+  uint8_t       porcentajeBateria;
   EstadoEnergia estado;
   uint32_t      cortesDetectados;
-  uint32_t      msEnInversor;   // tiempo acumulado alimentando desde bateria
+  uint32_t      msEnInversor;
   bool          alarmaSilenciada;
+  bool          deslastreActivo;
 };
 
 // ---------------------------------------------------------------------------
-// 3. Objetos globales de concurrencia y de hardware
+// Objetos de concurrencia y hardware
 // ---------------------------------------------------------------------------
-QueueHandle_t     colaMuestras = NULL;  // productor/consumidor
-SemaphoreHandle_t mutexEstado  = NULL;  // exclusion mutua
-SemaphoreHandle_t semAlerta    = NULL;  // senalizacion de eventos
+QueueHandle_t     colaMuestras = NULL;
+SemaphoreHandle_t mutexEstado  = NULL;
+SemaphoreHandle_t semAlerta    = NULL;
 
-EstadoSistema estado;                   // recurso compartido protegido
+EstadoSistema estado;
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 WiFiClient   clienteWiFi;
 PubSubClient mqtt(clienteWiFi);
 
-// Variables tocadas por la interrupcion del boton. "volatile" le prohibe al
-// compilador cachearlas en un registro, y el portMUX garantiza que el acceso
-// sea atomico frente a la ISR que corre en el otro nucleo.
 volatile uint32_t pulsacionesBoton = 0;
 portMUX_TYPE muxBoton = portMUX_INITIALIZER_UNLOCKED;
 
-// ---------------------------------------------------------------------------
-// 4. Rutina de interrupcion del boton de silencio
-//    IRAM_ATTR obliga a guardar la funcion en RAM interna para que pueda
-//    ejecutarse aunque la memoria flash este ocupada.
+TaskHandle_t hMuestreo, hControl, hPantalla, hRed;
+
 // ---------------------------------------------------------------------------
 void IRAM_ATTR isrBotonSilencio() {
-  static uint32_t ultimaPulsacion = 0;
+  static uint32_t ultima = 0;
   uint32_t ahora = millis();
-
-  if (ahora - ultimaPulsacion < 250) return;   // antirrebote por software
-  ultimaPulsacion = ahora;
+  if (ahora - ultima < 250) return;
+  ultima = ahora;
 
   portENTER_CRITICAL_ISR(&muxBoton);
   pulsacionesBoton++;
   portEXIT_CRITICAL_ISR(&muxBoton);
 }
 
-// ---------------------------------------------------------------------------
-// 5. TAREA 1 - Muestreo electrico          (Nucleo 1, prioridad 3, la mas alta)
-//    Es la unica tarea que toca el ADC. Usa vTaskDelayUntil para lograr un
-//    periodo ESTABLE de 50 ms: si el trabajo tardo 12 ms, duerme 38 ms.
-// ---------------------------------------------------------------------------
-void tareaMuestreo(void *parametros) {
+// ===========================================================================
+// TAREA 1 - Muestreo            (Nucleo 1, prioridad 3)
+// Unica tarea que toca el ADC. Ahora lee cinco canales en lugar de dos.
+// ===========================================================================
+void tareaMuestreo(void *p) {
   TickType_t ultimoDespertar = xTaskGetTickCount();
   Muestra m;
 
   for (;;) {
-    int lecturaV = analogRead(PIN_SENSOR_VOLTAJE);
-    int lecturaI = analogRead(PIN_SENSOR_CORRIENTE);
+    m.voltajeL1   = (analogRead(PIN_V_L1)  / ADC_MAXIMO) * VOLTAJE_MAXIMO;
+    m.corrienteL1 = (analogRead(PIN_I_L1)  / ADC_MAXIMO) * CORRIENTE_MAXIMA;
 
-    m.voltaje     = (lecturaV / ADC_MAXIMO) * VOLTAJE_MAXIMO;
-    m.corriente   = (lecturaI / ADC_MAXIMO) * CORRIENTE_MAXIMA;
-    m.potencia    = m.voltaje * m.corriente * 0.92;  // factor de potencia tipico
+    if (MONOFASICO) {
+      // En una acometida de dos hilos no existe L2. Se copia L1 para que la
+      // logica de desbalance no dispare falsas alarmas.
+      m.voltajeL2   = m.voltajeL1;
+      m.corrienteL2 = 0;
+    } else {
+      m.voltajeL2   = (analogRead(PIN_V_L2) / ADC_MAXIMO) * VOLTAJE_MAXIMO;
+      m.corrienteL2 = (analogRead(PIN_I_L2) / ADC_MAXIMO) * CORRIENTE_MAXIMA;
+    }
+
+    m.voltajeBateria = (analogRead(PIN_V_BAT) / ADC_MAXIMO) * BATERIA_MAXIMA;
+
+    // Potencia total de la vivienda: la suma de las dos lineas.
+    m.potencia = (m.voltajeL1 * m.corrienteL1 + m.voltajeL2 * m.corrienteL2) * 0.92;
     m.marcaTiempo = millis();
 
-    // Envio no bloqueante: si la cola estuviera llena preferimos descartar la
-    // muestra mas vieja antes que frenar el muestreo (los datos rancios no
-    // sirven en un sistema de proteccion electrica).
     if (xQueueSend(colaMuestras, &m, 0) != pdTRUE) {
       Muestra descartada;
       xQueueReceive(colaMuestras, &descartada, 0);
@@ -221,95 +324,96 @@ void tareaMuestreo(void *parametros) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// 6. TAREA 2 - Control y proteccion             (Nucleo 1, prioridad 2)
-//    Consume la cola, ejecuta la maquina de estados y actua sobre el rele.
-//    Es la unica tarea autorizada a ESCRIBIR en "estado".
-// ---------------------------------------------------------------------------
-void tareaControl(void *parametros) {
+// ===========================================================================
+// TAREA 2 - Control y proteccion   (Nucleo 1, prioridad 2)
+// ===========================================================================
+void tareaControl(void *p) {
   Muestra m;
   EstadoEnergia estadoAnterior = RED_NORMAL;
-  uint32_t ultimoCalculoEnergia = millis();
+  uint32_t ultimoCalculo = millis();
   uint32_t ultimaPulsacionAtendida = 0;
   uint32_t inicioApagon = 0;
 
   for (;;) {
-    // Bloqueo hasta que llegue una muestra. Mientras espera, esta tarea no
-    // consume absolutamente nada de CPU: el planificador se la da a otras.
     if (xQueueReceive(colaMuestras, &m, portMAX_DELAY) != pdTRUE) continue;
 
-    // --- Maquina de estados de la acometida -------------------------------
-    EstadoEnergia nuevoEstado;
-    if (m.voltaje < V_APAGON) {
-      // Primero se DECLARA el apagon; la transferencia al inversor se confirma
-      // 200 ms despues, que es lo que tarda el rele en asentarse. Asi se evita
-      // conmutar por un simple parpadeo de la red.
-      if (estadoAnterior != APAGON && estadoAnterior != MODO_INVERSOR) {
-        nuevoEstado  = APAGON;
-        inicioApagon = millis();
-      } else if (millis() - inicioApagon >= 200) {
-        nuevoEstado = MODO_INVERSOR;
-      } else {
-        nuevoEstado = APAGON;
-      }
-    } else if (m.voltaje < V_MINIMO_SEGURO || m.voltaje > V_MAXIMO_SEGURO) {
-      nuevoEstado = RED_ANORMAL;                   // hay red, pero peligrosa
+    EstadoEnergia nuevoEstado = evaluarRed(m, estadoAnterior, inicioApagon);
+
+    // --- Decidir el deslastre de carga -----------------------------------
+    // Dos motivos independientes para cortar las cargas no esenciales:
+    // que el consumo supere lo que aguanta el inversor, o que la bateria
+    // este por debajo del 50 %.
+    bool enBateria = (nuevoEstado == MODO_INVERSOR || nuevoEstado == APAGON);
+    bool deslastrar = HAY_INVERSOR && enBateria &&
+                      (m.potencia > POTENCIA_MAXIMA_INVERSOR ||
+                       m.voltajeBateria < BAT_BAJA);
+
+    // --- Actuadores -------------------------------------------------------
+    if (HAY_INVERSOR) {
+      digitalWrite(PIN_RELE_TRANSFER, nuevoEstado != RED_NORMAL);
     } else {
-      nuevoEstado = RED_NORMAL;
+      // Escenario C: sin inversor el rele solo DESCONECTA la vivienda de una
+      // red peligrosa. No hay adonde transferir, pero si de que proteger.
+      digitalWrite(PIN_RELE_TRANSFER, nuevoEstado == RED_NORMAL);
     }
+    digitalWrite(PIN_RELE_DESLASTRE, deslastrar);
 
-    // --- Actuadores --------------------------------------------------------
-    bool transferirAInversor = (nuevoEstado != RED_NORMAL);
-    digitalWrite(PIN_RELE_TRANSFER, transferirAInversor ? HIGH : LOW);
-    digitalWrite(PIN_LED_RED,       nuevoEstado == RED_NORMAL);
-    digitalWrite(PIN_LED_INVERSOR,  nuevoEstado == MODO_INVERSOR);
-    digitalWrite(PIN_LED_ALARMA,    nuevoEstado == RED_ANORMAL ||
-                                    nuevoEstado == APAGON);
+    digitalWrite(PIN_LED_RED,      nuevoEstado == RED_NORMAL);
+    digitalWrite(PIN_LED_INVERSOR, nuevoEstado == MODO_INVERSOR);
+    digitalWrite(PIN_LED_ALARMA,   nuevoEstado == RED_ANORMAL ||
+                                   nuevoEstado == FASE_PERDIDA ||
+                                   nuevoEstado == NEUTRO_PERDIDO ||
+                                   nuevoEstado == APAGON);
 
-    // --- Boton de silencio (leido desde la ISR de forma segura) ------------
+    // --- Boton de silencio ------------------------------------------------
     uint32_t pulsaciones;
     portENTER_CRITICAL(&muxBoton);
     pulsaciones = pulsacionesBoton;
     portEXIT_CRITICAL(&muxBoton);
-
     bool silenciar = (pulsaciones != ultimaPulsacionAtendida);
     if (silenciar) ultimaPulsacionAtendida = pulsaciones;
 
-    // --- Zona critica: actualizacion del estado compartido -----------------
-    // Se toma el mutex el MENOR tiempo posible. Todo el trabajo pesado
-    // (calculos, digitalWrite, Serial) queda deliberadamente fuera.
+    // --- Zona critica: lo mas corta posible -------------------------------
     if (xSemaphoreTake(mutexEstado, pdMS_TO_TICKS(100)) == pdTRUE) {
       uint32_t ahora   = millis();
-      uint32_t deltaMs = ahora - ultimoCalculoEnergia;
-      ultimoCalculoEnergia = ahora;
+      uint32_t deltaMs = ahora - ultimoCalculo;
+      ultimoCalculo = ahora;
 
-      estado.voltaje    = m.voltaje;
-      estado.corriente  = m.corriente;
-      estado.potencia   = m.potencia;
-      estado.energiaWh += m.potencia * (deltaMs / 3600000.0);
-      estado.estado     = nuevoEstado;
+      estado.voltajeL1         = m.voltajeL1;
+      estado.voltajeL2         = m.voltajeL2;
+      estado.corrienteL1       = m.corrienteL1;
+      estado.corrienteL2       = m.corrienteL2;
+      estado.potencia          = m.potencia;
+      estado.energiaWh        += m.potencia * (deltaMs / 3600000.0);
+      estado.voltajeBateria    = m.voltajeBateria;
+      estado.porcentajeBateria = porcentajeBateria(m.voltajeBateria);
+      estado.estado            = nuevoEstado;
+      estado.deslastreActivo   = deslastrar;
 
       if (silenciar) estado.alarmaSilenciada = !estado.alarmaSilenciada;
       if (nuevoEstado == APAGON && estadoAnterior != APAGON) {
-        estado.cortesDetectados++;   // se cuenta una sola vez por corte
+        estado.cortesDetectados++;
       }
-      if (nuevoEstado == MODO_INVERSOR) {
-        estado.msEnInversor += deltaMs;
-      }
+      if (nuevoEstado == MODO_INVERSOR) estado.msEnInversor += deltaMs;
 
       bool sonar = (nuevoEstado != RED_NORMAL) && !estado.alarmaSilenciada;
-      xSemaphoreGive(mutexEstado);   // se libera ANTES de tocar el zumbador
+      xSemaphoreGive(mutexEstado);
 
-      if (sonar) tone(PIN_ZUMBADOR, 2000, 120);
-      else       noTone(PIN_ZUMBADOR);
+      // Sonido distinto segun la gravedad: el neutro perdido y la bateria
+      // critica merecen un tono mas agudo e inconfundible.
+      if (sonar) {
+        bool urgente = (nuevoEstado == NEUTRO_PERDIDO) ||
+                       (m.voltajeBateria < BAT_CRITICA && enBateria);
+        tone(PIN_ZUMBADOR, urgente ? 3000 : 2000, 120);
+      } else {
+        noTone(PIN_ZUMBADOR);
+      }
     }
 
-    // --- Senalizacion de evento a la tarea de red --------------------------
-    // No se llama a MQTT desde aqui: publicar puede tardar segundos y esta
-    // tarea es critica. Solo se levanta la bandera y se sigue trabajando.
     if (nuevoEstado != estadoAnterior) {
-      Serial.printf("[CONTROL] Cambio de estado -> %d  (%.1f V)\n",
-                    nuevoEstado, m.voltaje);
+      Serial.printf("[CONTROL] %s  L1=%.1fV L2=%.1fV Bat=%.2fV\n",
+                    NOMBRE_ESTADO[nuevoEstado], m.voltajeL1, m.voltajeL2,
+                    m.voltajeBateria);
       xSemaphoreGive(semAlerta);
       estadoAnterior = nuevoEstado;
     }
@@ -317,50 +421,98 @@ void tareaControl(void *parametros) {
 }
 
 // ---------------------------------------------------------------------------
-// 7. TAREA 3 - Interfaz local (LCD)             (Nucleo 1, prioridad 1)
-//    Solo LEE el estado. El I2C es lento (~30 ms por refresco completo), por
-//    eso vive en su propia tarea de baja prioridad: si el control necesita la
-//    CPU, el planificador expulsa a esta sin ningun problema.
+// Maquina de estados de la acometida.
+// El orden de las comprobaciones va de MAS GRAVE a menos grave, porque una
+// falla grave puede parecerse a una leve si se mira solo una linea.
 // ---------------------------------------------------------------------------
-void tareaPantalla(void *parametros) {
+EstadoEnergia evaluarRed(const Muestra &m, EstadoEnergia anterior,
+                         uint32_t &inicioApagon) {
+
+  bool vivaL1 = m.voltajeL1 >= V_APAGON;
+  bool vivaL2 = m.voltajeL2 >= V_APAGON;
+  float desbalance = fabs(m.voltajeL1 - m.voltajeL2);
+
+  // 1) APAGON TOTAL: ninguna linea tiene tension.
+  if (!vivaL1 && !vivaL2) {
+    if (anterior != APAGON && anterior != MODO_INVERSOR) {
+      inicioApagon = millis();
+      return APAGON;
+    }
+    // Se esperan 200 ms antes de confirmar, para no conmutar por un parpadeo.
+    return (millis() - inicioApagon >= 200) ? MODO_INVERSOR : APAGON;
+  }
+
+  // 2) NEUTRO PERDIDO: las dos vivas pero muy desbalanceadas. Es lo mas
+  //    destructivo y por eso se comprueba antes que nada.
+  if (!MONOFASICO && vivaL1 && vivaL2 && desbalance > DESBALANCE_CRITICO) {
+    return NEUTRO_PERDIDO;
+  }
+
+  // 3) FASE PERDIDA: una viva y la otra no. Invisible con un solo sensor.
+  if (!MONOFASICO && (vivaL1 != vivaL2)) {
+    return FASE_PERDIDA;
+  }
+
+  // 4) Voltaje fuera de rango en cualquiera de las dos lineas.
+  if (m.voltajeL1 < V_MINIMO_SEGURO || m.voltajeL1 > V_MAXIMO_SEGURO) {
+    return RED_ANORMAL;
+  }
+  if (!MONOFASICO &&
+      (m.voltajeL2 < V_MINIMO_SEGURO || m.voltajeL2 > V_MAXIMO_SEGURO)) {
+    return RED_ANORMAL;
+  }
+
+  return RED_NORMAL;
+}
+
+// ---------------------------------------------------------------------------
+// Estimacion del estado de carga de un banco de plomo-acido de 12 V.
+// Es una aproximacion lineal entre 11.4 V (20 %) y 12.7 V (100 %); sirve para
+// avisar al usuario, no para un calculo de ingenieria.
+// ---------------------------------------------------------------------------
+uint8_t porcentajeBateria(float v) {
+  if (v >= BAT_LLENA)   return 100;
+  if (v <= BAT_CRITICA) return 20;
+  return (uint8_t)(20 + (v - BAT_CRITICA) * 80.0 / (BAT_LLENA - BAT_CRITICA));
+}
+
+// ===========================================================================
+// TAREA 3 - Pantalla local        (Nucleo 1, prioridad 1)
+// ===========================================================================
+void tareaPantalla(void *p) {
   TickType_t ultimoDespertar = xTaskGetTickCount();
-  const char *etiquetas[] = {"RED OK ", "V.MALO ", "APAGON ", "INVERSOR"};
+  const char *corto[] = { "RED OK", "V.MALO", "F.PERD", "N.PERD",
+                          "APAGON", "INVERS" };
 
   for (;;) {
-    EstadoSistema copia;
-
-    // Se copia el estado completo dentro del mutex y se suelta enseguida.
-    // Pintar la pantalla con el mutex tomado bloquearia al control 30 ms.
+    EstadoSistema c;
     if (xSemaphoreTake(mutexEstado, pdMS_TO_TICKS(200)) == pdTRUE) {
-      copia = estado;
+      c = estado;
       xSemaphoreGive(mutexEstado);
 
+      // Fila 1: las dos lineas, que es lo que la version 1 no mostraba.
       lcd.setCursor(0, 0);
-      lcd.printf("%6.1fV %5.2fA ", copia.voltaje, copia.corriente);
-      lcd.setCursor(0, 1);
-      lcd.printf("%-8s C:%-2u  ", etiquetas[copia.estado],
-                 copia.cortesDetectados);
-    }
+      if (MONOFASICO) {
+        lcd.printf("%5.1fV %5.2fA  ", c.voltajeL1, c.corrienteL1);
+      } else {
+        lcd.printf("L1%5.1f L2%5.1f ", c.voltajeL1, c.voltajeL2);
+      }
 
+      // Fila 2: estado, bateria y aviso de deslastre.
+      lcd.setCursor(0, 1);
+      lcd.printf("%-6s B%3u%% %s", corto[c.estado], c.porcentajeBateria,
+                 c.deslastreActivo ? "DL" : "  ");
+    }
     vTaskDelayUntil(&ultimoDespertar, PERIODO_PANTALLA);
   }
 }
 
-// ---------------------------------------------------------------------------
-// 8. TAREA 4 - Comunicaciones          (Nucleo 0, prioridad 1)
-//    Esta es la tarea "lenta y peligrosa": reconectar el WiFi puede tardar
-//    varios segundos. Al vivir en otro nucleo y en otra tarea, ese bloqueo
-//    JAMAS retrasa la deteccion del apagon.
-//
-//    Duerme sobre "semAlerta" con un tiempo maximo de espera: si ocurre un
-//    evento publica de inmediato; si no ocurre nada, el timeout la despierta
-//    a los 5 s para el reporte periodico. Esto es un patron clasico de
-//    "espera con vencimiento" y sustituye al polling.
-// ---------------------------------------------------------------------------
-void tareaRed(void *parametros) {
-  const char *etiquetas[] = {"RED_NORMAL", "RED_ANORMAL", "APAGON",
-                             "MODO_INVERSOR"};
-
+// ===========================================================================
+// TAREA 4 - Comunicaciones        (Nucleo 0, prioridad 1)
+// Aqui vive el bloqueo peligroso. Aislada en el otro nucleo, una reconexion
+// de 8 segundos no retrasa la deteccion de una falla.
+// ===========================================================================
+void tareaRed(void *p) {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD, WIFI_CANAL);
   mqtt.setServer(MQTT_SERVIDOR, MQTT_PUERTO);
 
@@ -379,18 +531,22 @@ void tareaRed(void *parametros) {
     }
     mqtt.loop();
 
-    EstadoSistema copia;
+    EstadoSistema c;
     if (xSemaphoreTake(mutexEstado, pdMS_TO_TICKS(200)) != pdTRUE) continue;
-    copia = estado;
+    c = estado;
     xSemaphoreGive(mutexEstado);
 
-    char carga[256];
+    char carga[384];
     snprintf(carga, sizeof(carga),
-             "{\"nodo\":\"%s\",\"v\":%.1f,\"i\":%.2f,\"w\":%.1f,"
-             "\"wh\":%.2f,\"estado\":\"%s\",\"cortes\":%u,\"seg_inv\":%u}",
-             MQTT_CLIENTE_ID, copia.voltaje, copia.corriente, copia.potencia,
-             copia.energiaWh, etiquetas[copia.estado], copia.cortesDetectados,
-             copia.msEnInversor / 1000);
+             "{\"nodo\":\"%s\",\"v_l1\":%.1f,\"v_l2\":%.1f,"
+             "\"i_l1\":%.2f,\"i_l2\":%.2f,\"w\":%.1f,\"wh\":%.2f,"
+             "\"bat_v\":%.2f,\"bat_pct\":%u,\"estado\":\"%s\","
+             "\"cortes\":%u,\"seg_inv\":%u,\"deslastre\":%s}",
+             MQTT_CLIENTE_ID, c.voltajeL1, c.voltajeL2,
+             c.corrienteL1, c.corrienteL2, c.potencia, c.energiaWh,
+             c.voltajeBateria, c.porcentajeBateria, NOMBRE_ESTADO[c.estado],
+             c.cortesDetectados, c.msEnInversor / 1000,
+             c.deslastreActivo ? "true" : "false");
 
     mqtt.publish(TOPICO_TELEMETRIA, carga);
     if (porEvento) mqtt.publish(TOPICO_ALERTAS, carga);
@@ -399,15 +555,10 @@ void tareaRed(void *parametros) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// 9. TAREA 5 - Diagnostico del planificador     (Nucleo 0, prioridad 0)
-//    Imprime cada 10 s cuanta memoria de pila le queda libre a cada tarea.
-//    Es la evidencia de que las cinco tareas realmente coexisten, y sirve
-//    para dimensionar las pilas sin adivinar.
-// ---------------------------------------------------------------------------
-TaskHandle_t hMuestreo, hControl, hPantalla, hRed;
-
-void tareaDiagnostico(void *parametros) {
+// ===========================================================================
+// TAREA 5 - Diagnostico           (Nucleo 0, prioridad 0)
+// ===========================================================================
+void tareaDiagnostico(void *p) {
   for (;;) {
     Serial.println(F("---- Pila libre por tarea (palabras) ----"));
     Serial.printf("  Muestreo : %u\n", uxTaskGetStackHighWaterMark(hMuestreo));
@@ -420,16 +571,16 @@ void tareaDiagnostico(void *parametros) {
 }
 
 // ---------------------------------------------------------------------------
-// 10. setup() - se ejecuta una sola vez: crea los objetos de sincronizacion
-//     y despues las tareas. A partir del ultimo xTaskCreatePinnedToCore, el
-//     planificador toma el control del microcontrolador.
-// ---------------------------------------------------------------------------
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println(F("\n== SmartPower RD - ITLA 2026-C-2 =="));
+  Serial.println(F("\n== SmartPower RD v2.0 - ITLA 2026-C-2 =="));
+  Serial.printf("Acometida: %s   Inversor: %s\n",
+                MONOFASICO ? "monofasica 120 V" : "fase partida 120/240 V",
+                HAY_INVERSOR ? "si" : "no");
 
   pinMode(PIN_RELE_TRANSFER,  OUTPUT);
+  pinMode(PIN_RELE_DESLASTRE, OUTPUT);
   pinMode(PIN_LED_RED,        OUTPUT);
   pinMode(PIN_LED_INVERSOR,   OUTPUT);
   pinMode(PIN_LED_ALARMA,     OUTPUT);
@@ -441,38 +592,32 @@ void setup() {
   Wire.begin(21, 22);
   lcd.init();
   lcd.backlight();
-  lcd.print("SmartPower RD");
+  lcd.print("SmartPower RD 2.0");
   lcd.setCursor(0, 1);
   lcd.print("2024-1932");
 
-  estado = {0, 0, 0, 0, RED_NORMAL, 0, 0, false};
+  estado = {0, 0, 0, 0, 0, 0, 0, 0, RED_NORMAL, 0, 0, false, false};
 
-  // Objetos de concurrencia. Si alguno falla no hay sistema: se detiene aqui.
   colaMuestras = xQueueCreate(10, sizeof(Muestra));
   mutexEstado  = xSemaphoreCreateMutex();
   semAlerta    = xSemaphoreCreateBinary();
-
   if (!colaMuestras || !mutexEstado || !semAlerta) {
     Serial.println(F("ERROR: no se pudieron crear los objetos de FreeRTOS"));
     while (true) delay(1000);
   }
 
-  //                  funcion          nombre       pila   param prio  handle nucleo
-  xTaskCreatePinnedToCore(tareaMuestreo,   "Muestreo",   2048, NULL, 3, &hMuestreo, 1);
-  xTaskCreatePinnedToCore(tareaControl,    "Control",    4096, NULL, 2, &hControl,  1);
-  xTaskCreatePinnedToCore(tareaPantalla,   "Pantalla",   4096, NULL, 1, &hPantalla, 1);
-  xTaskCreatePinnedToCore(tareaRed,        "Red",        8192, NULL, 1, &hRed,      0);
-  xTaskCreatePinnedToCore(tareaDiagnostico,"Diagnostico",3072, NULL, 0, NULL,       0);
+  xTaskCreatePinnedToCore(tareaMuestreo,    "Muestreo",    2048, NULL, 3, &hMuestreo, 1);
+  xTaskCreatePinnedToCore(tareaControl,     "Control",     4096, NULL, 2, &hControl,  1);
+  xTaskCreatePinnedToCore(tareaPantalla,    "Pantalla",    4096, NULL, 1, &hPantalla, 1);
+  xTaskCreatePinnedToCore(tareaRed,         "Red",         8192, NULL, 1, &hRed,      0);
+  xTaskCreatePinnedToCore(tareaDiagnostico, "Diagnostico", 3072, NULL, 0, NULL,       0);
 
   delay(1500);
   lcd.clear();
 }
 
 // ---------------------------------------------------------------------------
-// 11. loop() queda VACIO a proposito.
-//     En un diseno con FreeRTOS todo el trabajo vive en tareas. loop() es en
-//     realidad la tarea "loopTask" de Arduino; dejarla vacia y cediendo el
-//     tiempo evita que compita con las tareas del sistema.
+// loop() vacio a proposito: en un diseno con FreeRTOS todo vive en tareas.
 // ---------------------------------------------------------------------------
 void loop() {
   vTaskDelay(pdMS_TO_TICKS(1000));
