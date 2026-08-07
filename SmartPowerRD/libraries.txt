@@ -1,0 +1,3 @@
+# Librerias que Wokwi debe descargar automaticamente al abrir el proyecto.
+LiquidCrystal I2C
+PubSubClient

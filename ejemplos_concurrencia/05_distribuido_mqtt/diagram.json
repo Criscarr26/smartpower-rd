@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "author": "Cristian Carrera 2024-1932 - ITLA",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": 0, "left": 0, "attrs": {} },
+    { "type": "wokwi-potentiometer", "id": "pot", "top": -140, "left": -280,
+      "attrs": { "value": "450" } }
+  ],
+  "connections": [
+    [ "esp:TX", "$serialMonitor:RX", "" ],
+    [ "esp:RX", "$serialMonitor:TX", "" ],
+
+    [ "pot:VCC", "esp:3V3",   "red",   [] ],
+    [ "pot:GND", "esp:GND.1", "black", [] ],
+    [ "pot:SIG", "esp:34",    "green", [] ]
+  ],
+  "dependencies": {}
+}

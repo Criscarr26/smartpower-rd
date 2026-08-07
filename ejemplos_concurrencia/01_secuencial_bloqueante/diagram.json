@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "author": "Cristian Carrera 2024-1932 - ITLA",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "wokwi-arduino-uno", "id": "uno", "top": 0, "left": 0, "attrs": {} },
+
+    { "type": "wokwi-led", "id": "ledVida", "top": -100, "left": 180,
+      "attrs": { "color": "green", "label": "VIDA (13)" } },
+    { "type": "wokwi-resistor", "id": "r1", "top": -100, "left": 280,
+      "attrs": { "value": "220" } },
+
+    { "type": "wokwi-led", "id": "ledAlerta", "top": -20, "left": 180,
+      "attrs": { "color": "red", "label": "ALERTA (12)" } },
+    { "type": "wokwi-resistor", "id": "r2", "top": -20, "left": 280,
+      "attrs": { "value": "220" } },
+
+    { "type": "wokwi-buzzer", "id": "bz", "top": 70, "left": 180,
+      "attrs": { "volume": "0.1" } },
+
+    { "type": "wokwi-pushbutton", "id": "btn", "top": 160, "left": 180,
+      "attrs": { "color": "blue", "label": "EMERGENCIA (2)" } }
+  ],
+  "connections": [
+    [ "uno:13", "ledVida:A", "green", [] ],
+    [ "ledVida:C", "r1:1", "black", [] ],
+    [ "r1:2", "uno:GND.1", "black", [] ],
+
+    [ "uno:12", "ledAlerta:A", "red", [] ],
+    [ "ledAlerta:C", "r2:1", "black", [] ],
+    [ "r2:2", "uno:GND.1", "black", [] ],
+
+    [ "uno:8", "bz:1", "purple", [] ],
+    [ "bz:2", "uno:GND.2", "black", [] ],
+
+    [ "uno:2", "btn:1.l", "orange", [] ],
+    [ "btn:2.l", "uno:GND.3", "black", [] ]
+  ],
+  "dependencies": {}
+}

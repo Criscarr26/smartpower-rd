@@ -1,0 +1,48 @@
+﻿==============================================================
+ CONCURRENCIA, PARALELISMO Y DISTRIBUCION - EVIDENCIA MEDIDA
+ Cristian Carrera - 2024-1932 - ITLA - IA e IoT 2026-C-2
+==============================================================
+
+==============================================================
+PARTE 1 - 8 lecturas de sensores remotos (0.5 s de espera c/u)
+==============================================================
+  Secuencial (un sensor detras de otro)         4.00 s
+  Con 8 HILOS (concurrencia)                    0.51 s
+  Con ASYNCIO (concurrencia, 1 solo hilo)       0.51 s
+
+  Aceleracion con hilos   :  7.87 x
+  Aceleracion con asyncio :  7.87 x
+  Lectura: cuando el cuello de botella es la ESPERA, ocho tareas
+  caben en el tiempo de una sola. Y asyncio lo logra sin crear
+  ni un solo hilo adicional: la concurrencia no necesita hilos.
+
+==============================================================
+PARTE 2 - 8 calculos de RMS (CPU pura) en 12 nucleos
+==============================================================
+  Secuencial                                    5.21 s
+  Con 8 HILOS (frenados por el GIL)             5.27 s
+  Con PROCESOS (paralelismo real)               1.82 s
+
+  Aceleracion con hilos    :  0.99 x
+  Aceleracion con procesos :  2.86 x
+  Los procesos son 2.9 veces mas rapidos que los hilos.
+  Lectura: los hilos no aceleran nada porque el GIL solo deja
+  ejecutar bytecode a uno a la vez. Los procesos si, porque cada
+  uno es un interprete independiente sobre un nucleo distinto.
+  Ese es, exactamente, el precio de confundir CONCURRENCIA
+  (organizar tareas) con PARALELISMO (ejecutarlas a la vez).
+
+==============================================================
+PARTE 3 - Condicion de carrera y Lock (el Ejemplo 4, en Python)
+==============================================================
+  Esperado                : 200,000
+  Sin Lock (4 hilos)      : 50,126   -> perdidas: 149,874  (74.9 %)
+  Con Lock (4 hilos)      : 200,000   -> perdidas: 0  (0.0 %)
+
+  El mismo algoritmo, los mismos datos, la misma maquina.
+  Lo unico que cambia es el candado. Un bug de concurrencia que
+  NO se manifiesta en una corrida sigue estando ahi: por eso no
+  se corrigen 'probando', se corrigen protegiendo el dato.
+
+Fin de la demostracion.
+
