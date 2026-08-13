@@ -37,7 +37,9 @@
       "attrs": { "volume": "0.1" } },
 
     { "type": "wokwi-pushbutton", "id": "btn", "top": 360, "left": -300,
-      "attrs": { "color": "blue", "label": "SILENCIO" } }
+      "attrs": { "color": "blue", "label": "SILENCIO" } },
+
+    { "type": "wokwi-microsd-card", "id": "sd", "top": 300, "left": 380, "attrs": {} }
   ],
   "connections": [
     [ "esp:TX", "$serialMonitor:RX", "" ],
@@ -92,7 +94,14 @@
     [ "bz:2",   "esp:GND.3", "black",  [] ],
 
     [ "esp:14",  "btn:1.l",   "orange", [] ],
-    [ "btn:2.l", "esp:GND.1", "black",  [] ]
+    [ "btn:2.l", "esp:GND.1", "black",  [] ],
+
+    [ "sd:VCC",  "esp:5V",    "red",    [] ],
+    [ "sd:GND",  "esp:GND.2", "black",  [] ],
+    [ "sd:CS",   "esp:5",     "yellow", [] ],
+    [ "sd:SCK",  "esp:18",    "green",  [] ],
+    [ "sd:MOSI", "esp:23",    "blue",   [] ],
+    [ "sd:MISO", "esp:19",    "purple", [] ]
   ],
   "dependencies": {}
 }

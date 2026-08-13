@@ -23,6 +23,10 @@
      vigila el voltaje de la bateria.
   3. QUE SE PROTEGE. Se separa proteger los electrodomesticos de proteger el
      inversor, con un rele de deslastre para las cargas no esenciales.
+  4. REGISTRO LOCAL. Una microSD guarda cada evento ANTES de intentar
+     enviarlo, y anota aparte si el envio se consiguio. Sin esto, un apagon
+     que tumba el router se pierde sin dejar rastro; y son justamente los
+     apagones mas severos los que tumban el router.
 
   ============================================================================
   1. ¿UNA FASE O DOS FASES?
@@ -133,6 +137,7 @@
      GPIO 27 ........ zumbador
      GPIO 14 ........ boton de silencio (INPUT_PULLUP, con interrupcion)
      GPIO 21/22 ..... LCD 16x2 I2C
+     GPIO 5 ......... CS del modulo microSD (SPI: MOSI 23, MISO 19, SCK 18)
 
   En la simulacion los sensores se sustituyen por potenciometros, que
   permiten provocar cada falla a voluntad durante la demostracion.
@@ -143,6 +148,8 @@
 #include <LiquidCrystal_I2C.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <SPI.h>
+#include <SD.h>
 
 #if __has_include("secrets.h")
   #include "secrets.h"
@@ -182,6 +189,9 @@ const uint8_t PIN_LED_INVERSOR   = 2;
 const uint8_t PIN_LED_ALARMA     = 13;
 const uint8_t PIN_ZUMBADOR       = 27;
 const uint8_t PIN_BOTON_SILENCIO = 14;
+const uint8_t PIN_SD_CS          = 5;    // SPI: MOSI 23, MISO 19, SCK 18
+
+const char *ARCHIVO_LOG = "/smartpower.csv";
 
 // ---------------------------------------------------------------------------
 // Calibracion
@@ -257,6 +267,45 @@ struct EstadoSistema {
 };
 
 // ---------------------------------------------------------------------------
+// REGISTRO LOCAL EN MICROSD
+// ---------------------------------------------------------------------------
+// Entre DETECTAR un apagon y CONSEGUIR ENVIARLO pueden pasar muchas cosas: que
+// el WiFi este caido, que el router se haya apagado con la luz, o que el propio
+// equipo se reinicie. Si el unico registro vive en la nube, ese evento se
+// pierde y nadie se entera de que se perdio.
+//
+// La solucion es un registro local de solo-añadir (append-only) con
+// RECONCILIACION en dos pasos:
+//
+//    1. Al detectar el evento se escribe una linea con estado PENDIENTE.
+//    2. Cuando MQTT confirma la publicacion se añade otra linea CONFIRMADO
+//       con el mismo numero de secuencia.
+//
+// Asi, al revisar el archivo, cualquier secuencia que tenga PENDIENTE y no
+// tenga su CONFIRMADO es un evento que ocurrio de verdad pero que nunca llego
+// a la nube. Ese dato es justamente el que necesita el modelo de aprendizaje
+// automatico, porque los apagones que tumban la comunicacion son los mas
+// severos y son precisamente los que se perderian.
+//
+// NOTA DE CONCURRENCIA: la libreria SD NO es segura entre hilos. Por eso
+// UNA SOLA tarea toca la tarjeta (tareaRegistro) y las demas le hablan por
+// colas. Es la misma regla del mutex, aplicada a un periferico.
+// ---------------------------------------------------------------------------
+struct Evento {
+  uint32_t      secuencia;
+  uint32_t      marcaTiempo;
+  EstadoEnergia estado;
+  float         voltajeL1;
+  float         voltajeL2;
+  float         bateria;
+  bool          confirmacion;   // false = evento nuevo, true = acuse de envio
+};
+
+QueueHandle_t colaEventos = NULL;   // control y red -> registro
+volatile uint32_t secuenciaEventos = 0;
+volatile bool     hayTarjeta = false;
+
+// ---------------------------------------------------------------------------
 // Objetos de concurrencia y hardware
 // ---------------------------------------------------------------------------
 QueueHandle_t     colaMuestras = NULL;
@@ -272,7 +321,7 @@ PubSubClient mqtt(clienteWiFi);
 volatile uint32_t pulsacionesBoton = 0;
 portMUX_TYPE muxBoton = portMUX_INITIALIZER_UNLOCKED;
 
-TaskHandle_t hMuestreo, hControl, hPantalla, hRed;
+TaskHandle_t hMuestreo, hControl, hPantalla, hRed, hRegistro;
 
 // ---------------------------------------------------------------------------
 void IRAM_ATTR isrBotonSilencio() {
@@ -414,6 +463,19 @@ void tareaControl(void *p) {
       Serial.printf("[CONTROL] %s  L1=%.1fV L2=%.1fV Bat=%.2fV\n",
                     NOMBRE_ESTADO[nuevoEstado], m.voltajeL1, m.voltajeL2,
                     m.voltajeBateria);
+
+      // Se registra el evento ANTES de intentar enviarlo. Si el equipo muere
+      // en el intento, el hecho ya quedo escrito en la tarjeta.
+      Evento ev;
+      ev.secuencia    = ++secuenciaEventos;
+      ev.marcaTiempo  = millis();
+      ev.estado       = nuevoEstado;
+      ev.voltajeL1    = m.voltajeL1;
+      ev.voltajeL2    = m.voltajeL2;
+      ev.bateria      = m.voltajeBateria;
+      ev.confirmacion = false;
+      xQueueSend(colaEventos, &ev, 0);
+
       xSemaphoreGive(semAlerta);
       estadoAnterior = nuevoEstado;
     }
@@ -519,6 +581,11 @@ void tareaRed(void *p) {
   for (;;) {
     bool porEvento = (xSemaphoreTake(semAlerta, PERIODO_RED) == pdTRUE);
 
+    // Se captura el numero de secuencia en el instante de despertar. Si el
+    // control detectara otro evento mientras se publica, el acuse seguiria
+    // apuntando al que desperto a esta tarea y no al mas reciente.
+    uint32_t seqEvento = secuenciaEventos;
+
     if (WiFi.status() != WL_CONNECTED) {
       WiFi.begin(WIFI_SSID, WIFI_PASSWORD, WIFI_CANAL);
       vTaskDelay(pdMS_TO_TICKS(500));
@@ -549,10 +616,86 @@ void tareaRed(void *p) {
              c.deslastreActivo ? "true" : "false");
 
     mqtt.publish(TOPICO_TELEMETRIA, carga);
-    if (porEvento) mqtt.publish(TOPICO_ALERTAS, carga);
+
+    if (porEvento) {
+      bool enviado = mqtt.publish(TOPICO_ALERTAS, carga);
+
+      // Solo si el broker acepto la publicacion se emite el acuse. Asi el
+      // archivo distingue lo que ocurrio de lo que ademas llego a la nube.
+      if (enviado) {
+        Evento acuse;
+        acuse.secuencia    = seqEvento;
+        acuse.marcaTiempo  = millis();
+        acuse.estado       = c.estado;
+        acuse.voltajeL1    = c.voltajeL1;
+        acuse.voltajeL2    = c.voltajeL2;
+        acuse.bateria      = c.voltajeBateria;
+        acuse.confirmacion = true;
+        xQueueSend(colaEventos, &acuse, 0);
+      }
+    }
 
     Serial.printf("[RED] %s -> %s\n", porEvento ? "ALERTA" : "periodico", carga);
   }
+}
+
+// ===========================================================================
+// TAREA 6 - Registro en microSD      (Nucleo 0, prioridad 1)
+// Unica tarea que toca la tarjeta. Las demas le hablan por cola, porque la
+// libreria SD no es segura entre hilos y escribir es lento (decenas de ms).
+// ===========================================================================
+void tareaRegistro(void *p) {
+  Evento ev;
+
+  for (;;) {
+    if (xQueueReceive(colaEventos, &ev, portMAX_DELAY) != pdTRUE) continue;
+    if (!hayTarjeta) continue;
+
+    File f = SD.open(ARCHIVO_LOG, FILE_APPEND);
+    if (!f) {
+      Serial.println(F("[SD] No se pudo abrir el archivo de registro"));
+      hayTarjeta = false;          // se deja de intentar hasta reiniciar
+      continue;
+    }
+
+    // Formato: secuencia,ms,tipo,estado,L1,L2,bateria
+    f.printf("%u,%u,%s,%s,%.1f,%.1f,%.2f\n",
+             ev.secuencia, ev.marcaTiempo,
+             ev.confirmacion ? "CONFIRMADO" : "PENDIENTE",
+             NOMBRE_ESTADO[ev.estado],
+             ev.voltajeL1, ev.voltajeL2, ev.bateria);
+    f.close();
+
+    Serial.printf("[SD] #%u %s %s\n", ev.secuencia,
+                  ev.confirmacion ? "CONFIRMADO" : "PENDIENTE",
+                  NOMBRE_ESTADO[ev.estado]);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Prepara la tarjeta y escribe la cabecera si el archivo es nuevo.
+// ---------------------------------------------------------------------------
+bool iniciarTarjeta() {
+  if (!SD.begin(PIN_SD_CS)) {
+    Serial.println(F("[SD] No se detecto tarjeta. El sistema sigue sin registro."));
+    return false;
+  }
+
+  bool nuevo = !SD.exists(ARCHIVO_LOG);
+  File f = SD.open(ARCHIVO_LOG, FILE_APPEND);
+  if (!f) return false;
+
+  if (nuevo) {
+    f.println(F("secuencia,ms,tipo,estado,voltaje_l1,voltaje_l2,bateria"));
+  }
+  // Marca de arranque: permite detectar reinicios inesperados al analizar
+  // el archivo, que es en si mismo un dato interesante.
+  f.printf("0,%u,ARRANQUE,-,0.0,0.0,0.00\n", millis());
+  f.close();
+
+  Serial.print(F("[SD] Registro listo en "));
+  Serial.println(ARCHIVO_LOG);
+  return true;
 }
 
 // ===========================================================================
@@ -565,7 +708,10 @@ void tareaDiagnostico(void *p) {
     Serial.printf("  Control  : %u\n", uxTaskGetStackHighWaterMark(hControl));
     Serial.printf("  Pantalla : %u\n", uxTaskGetStackHighWaterMark(hPantalla));
     Serial.printf("  Red      : %u\n", uxTaskGetStackHighWaterMark(hRed));
+    Serial.printf("  Registro : %u\n", uxTaskGetStackHighWaterMark(hRegistro));
     Serial.printf("  Heap libre: %u bytes\n", ESP.getFreeHeap());
+    Serial.printf("  Tarjeta SD: %s   eventos: %u\n",
+                  hayTarjeta ? "presente" : "ausente", secuenciaEventos);
     vTaskDelay(pdMS_TO_TICKS(10000));
   }
 }
@@ -599,17 +745,24 @@ void setup() {
   estado = {0, 0, 0, 0, 0, 0, 0, 0, RED_NORMAL, 0, 0, false, false};
 
   colaMuestras = xQueueCreate(10, sizeof(Muestra));
+  colaEventos  = xQueueCreate(20, sizeof(Evento));
   mutexEstado  = xSemaphoreCreateMutex();
   semAlerta    = xSemaphoreCreateBinary();
-  if (!colaMuestras || !mutexEstado || !semAlerta) {
+  if (!colaMuestras || !colaEventos || !mutexEstado || !semAlerta) {
     Serial.println(F("ERROR: no se pudieron crear los objetos de FreeRTOS"));
     while (true) delay(1000);
   }
+
+  // La tarjeta es opcional: si no esta, el sistema sigue protegiendo la casa
+  // y solo pierde el historico. Una funcion de seguridad nunca debe depender
+  // de un periferico de conveniencia.
+  hayTarjeta = iniciarTarjeta();
 
   xTaskCreatePinnedToCore(tareaMuestreo,    "Muestreo",    2048, NULL, 3, &hMuestreo, 1);
   xTaskCreatePinnedToCore(tareaControl,     "Control",     4096, NULL, 2, &hControl,  1);
   xTaskCreatePinnedToCore(tareaPantalla,    "Pantalla",    4096, NULL, 1, &hPantalla, 1);
   xTaskCreatePinnedToCore(tareaRed,         "Red",         8192, NULL, 1, &hRed,      0);
+  xTaskCreatePinnedToCore(tareaRegistro,    "Registro",    4096, NULL, 1, &hRegistro, 0);
   xTaskCreatePinnedToCore(tareaDiagnostico, "Diagnostico", 3072, NULL, 0, NULL,       0);
 
   delay(1500);
